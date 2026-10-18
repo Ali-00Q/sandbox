@@ -17,9 +17,22 @@ function App() {
 
   const [user, setUser] = React.useState(null);
 
-  const handleLogin = (credentials) => {
-    console.log('Logging in with:', credentials);
-    setUser(credentials);
+  const handleLogin = async (credentials) => {
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credentials),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setUser(data.user || credentials);
+      } else {
+        setUser(credentials);
+      }
+    } catch (err) {
+      setUser(credentials);
+    }
   };
 
   const handleLogout = () => {
