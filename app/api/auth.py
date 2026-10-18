@@ -1,67 +1,92 @@
+import datetime
 import os
-from datetime import datetime, timedelta, timezone
-import bcrypt
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 import jwt
-from fastapi import APIRouter, HTTPException, status
+from passlib.context import CryptContext
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api", tags=["auth"])
 
-SECRET_KEY = os.getenv("JWT_SECRET", os.getenv("SECRET_KEY", "default-jwt-secret-key-change-in-production"))
+SECRET_KEY = os.getenv("SECRET_KEY", "default-insecure-secret-key-change-me")
 ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
-DEMO_USER = os.getenv("AUTH_USERNAME", "admin").lower()
-DEMO_PASS = os.getenv("AUTH_PASSWORD", "admin123")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-_mock_users_passwords = {
-    DEMO_USER: bcrypt.hashpw(DEMO_PASS.encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
-    "user@example.com": bcrypt.hashpw("user123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
-    "user": bcrypt.hashpw("user123".encode("utf-8"), bcrypt.gensalt()).decode("utf-8"),
-}
+AUTH_USERNAME = os.getenv("AUTH_USERNAME", "admin")
+_env_password = os.getenv("AUTH_PASSWORD", "admin123")
+AUTH_PASSWORD_HASH = os.getenv("AUTH_PASSWORD_HASH") or pwd_context.hash(_env_password)
+
 
 class LoginRequest(BaseModel):
-    username: str | None = None
-    email: str | None = None
+    username: str
     password: str
+
 
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: dict | None = None
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login", auto_error=False)
+
+
+def get_current_user(token: Annotated[str | None, Depends(oauth2_scheme)] = None) -> dict:
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     try:
-        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
-    except Exception:
-        return False
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str | None = payload.get("sub")
+        if username is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return {"username": username}
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token or token expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
 
 @router.post("/login", response_model=TokenResponse)
 def login(credentials: LoginRequest) -> TokenResponse:
-    identifier = (credentials.username or credentials.email or "").strip().lower()
-    if not identifier or not credentials.password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username/email and password are required"
-        )
+    is_valid_user = credentials.username == AUTH_USERNAME
+    is_valid_password = pwd_context.verify(credentials.password, AUTH_PASSWORD_HASH) if is_valid_user else False
 
-    hashed_password = _mock_users_passwords.get(identifier)
-    if not hashed_password or not verify_password(credentials.password, hashed_password):
+    if not is_valid_user or not is_valid_password:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password"
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    expires_delta = timedelta(hours=24)
-    expire = datetime.now(timezone.utc) + expires_delta
-    payload = {
-        "sub": identifier,
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expire = now + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token_payload = {
+        "sub": credentials.username,
         "exp": expire,
-        "iat": datetime.now(timezone.utc)
+        "iat": now,
     }
-    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
+    token = jwt.encode(token_payload, SECRET_KEY, algorithm=ALGORITHM)
     return TokenResponse(
         access_token=token,
         token_type="bearer",
-        user={"username": identifier}
+        user={"username": credentials.username},
     )
+
+
+@router.get("/me")
+def get_me(current_user: Annotated[dict, Depends(get_current_user)]) -> dict:
+    return current_user
